@@ -1,0 +1,97 @@
+# Builds upstream ARMSX2 for the Galaxy A25 (Exynos 1280: 2x Cortex-A78 + 6x Cortex-A55, Mali-G68).
+#
+# Same recipe upstream ships as its "a13" tier (tools/build-release-targets.sh): minSdk 33, NDK 29,
+# -march=armv8.2-a+fp16+dotprod, PGO with upstream's own profile. Only the 4K-page core is built;
+# the A25 runs 4K pages, so the 16K core upstream also ships would be dead weight here.
+# The APK is signed with the debug key and uses its own package id, so it installs beside the
+# upstream app instead of colliding with its signature.
+name: Build ARMSX2 (Galaxy A25)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: ARMSX2 commit SHA to build (the patch is verified against the default)
+        required: true
+        default: 7f9144189c74edcf5a7ab3ba2aa2247635d24047
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref || '7f9144189c74edcf5a7ab3ba2aa2247635d24047' }}
+      NDK_VERSION: 29.0.14206865
+    steps:
+      - name: Check out this repository (patch)
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Fetch ARMSX2 at the pinned commit
+        run: |
+          git init src
+          git -C src remote add origin https://github.com/ARMSX2/ARMSX2.git
+          git -C src fetch --depth 1 origin "$UPSTREAM_REF"
+          git -C src checkout --detach FETCH_HEAD
+          git -C src submodule update --init --recursive --depth 1
+
+      - name: Apply patch
+        run: git -C src apply --verbose "$GITHUB_WORKSPACE"/overlay/patches/*.patch
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install NDK and CMake
+        run: |
+          yes | sdkmanager "ndk;${NDK_VERSION}" "cmake;3.31.6" >/dev/null || true
+          test -d "$ANDROID_HOME/ndk/${NDK_VERSION}"
+
+      - name: Fetch shaderc dependencies
+        working-directory: src/platforms/android
+        run: python3 app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+
+      - name: Add Rust Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Build
+        working-directory: src/platforms/android
+        run: |
+          ./gradlew :app:assembleGithubRelease \
+            -Parmsx2.minSdk=33 \
+            -Parmsx2.ndkVersion="$NDK_VERSION" \
+            -Parmsx2.march=armv8.2-a+fp16+dotprod \
+            -Parmsx2.hostPageSize=0x1000 \
+            -Parmsx2.nativeLibName=emucore_4k \
+            -Parmsx2.pgo=optimize \
+            -Parmsx2.pgoProfile="$PWD/pgo/armsx2.profdata" \
+            -Parmsx2.applicationId=com.armsx2.a25 \
+            -Parmsx2.versionCode="$(date -u +%Y%m%d)" \
+            -Parmsx2.versionName="a25-$(git -C ../.. rev-parse --short HEAD)" \
+            --stacktrace
+
+      - name: Verify APK
+        working-directory: src/platforms/android
+        run: |
+          APK=app/build/outputs/apk/github/release/app-github-release.apk
+          test -f "$APK"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libemucore_4k.so"
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-a25-apk
+          path: src/platforms/android/app/build/outputs/apk/github/release/app-github-release.apk
+          if-no-files-found: error
