@@ -1,0 +1,196 @@
+diff --git a/platforms/android/app/src/main/java/com/armsx2/config/DeviceTier.kt b/platforms/android/app/src/main/java/com/armsx2/config/DeviceTier.kt
+new file mode 100644
+index 0000000..83f678e
+--- /dev/null
++++ b/platforms/android/app/src/main/java/com/armsx2/config/DeviceTier.kt
+@@ -0,0 +1,68 @@
++package com.armsx2.config
++
++import java.io.File
++
++/**
++ * How many fast ("performance") cores this device has, read the way the native core reads them.
++ *
++ * The core confines the EE, GS and (with MTVU) VU1 threads to the performance tier only when the tier
++ * has a processor for each of them (IopThread::PlanTier in pcsx2/IopThread/IopPlacement.cpp); otherwise it
++ * leaves them to the scheduler. A part with two fast cores (Exynos 1280: 2x Cortex-A78 + 6x Cortex-A55)
++ * never gets that placement, and it is the class of device whose games miss frames most. That is the
++ * device automatic performance tuning is for, so [autoTuneDefault] turns it on there and nowhere else.
++ *
++ * Same source and same ratio as IopThread::PerformanceMask: /sys/devices/system/cpu/cpuN/cpu_capacity,
++ * and every core within [PERFORMANCE_CLUSTER_RATIO] of the fastest. Frequency is deliberately NOT a
++ * fallback: an A78 at 2.4 GHz against an A55 at 2.0 GHz is a ratio of 0.83, which would put the little
++ * cores in the tier. When capacity cannot be read the answer is "unknown", and unknown changes nothing.
++ */
++object DeviceTier {
++    /** Mirrors IopThread::kPerformanceClusterRatio. */
++    const val PERFORMANCE_CLUSTER_RATIO = 0.75
++
++    /** EE + GS + VU1 (MTVU). Fewer performance cores than this cannot hold the core's busy threads. */
++    const val BUSY_THREADS = 3
++
++    private val CPU_DIR_NAME = Regex("cpu[0-9]+")
++
++    /** cpu_capacity of every processor in cpu-number order; 0 where unreadable. Empty with nothing to read. */
++    internal fun readCapacities(cpuDir: File = File("/sys/devices/system/cpu")): List<Int> {
++        val dirs = cpuDir.listFiles()?.filter { it.isDirectory && CPU_DIR_NAME.matches(it.name) }
++            ?: return emptyList()
++        return dirs
++            .sortedBy { it.name.substring(3).toInt() }
++            .map { readInt(File(it, "cpu_capacity")) }
++    }
++
++    /** Plain stream read: sysfs nodes report a size of 0, so a size-based read comes back empty. */
++    private fun readInt(file: File): Int = try {
++        file.bufferedReader().use { it.readLine() }?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
++    } catch (e: Exception) {
++        0
++    }
++
++    /** Processors within [PERFORMANCE_CLUSTER_RATIO] of the fastest, or null when the cores cannot be told apart. */
++    internal fun performanceCores(capacities: List<Int>): Int? {
++        val peak = capacities.maxOrNull() ?: return null
++        if (peak <= 0) return null
++        val threshold = (peak * PERFORMANCE_CLUSTER_RATIO).toInt()
++        return capacities.count { it > 0 && it >= threshold }
++    }
++
++    /** True only when the tier is known and too narrow for the core's busy threads. */
++    internal fun isNarrow(performanceCores: Int?): Boolean =
++        performanceCores != null && performanceCores < BUSY_THREADS
++
++    // ART reports "Dalvik" as its VM name. Off a device (JVM unit tests, desktop tools) nothing is probed,
++    // so a host that happens to expose cpu_capacity cannot change a default under test.
++    private val onAndroid: Boolean = System.getProperty("java.vm.name") == "Dalvik"
++
++    /** Performance-core count of this device; null off-device or when capacity cannot be read. */
++    val performanceCoreCount: Int? by lazy {
++        if (onAndroid) performanceCores(readCapacities()) else null
++    }
++
++    /** Default for EmuCore/AutoTune: on for a narrow performance tier, off otherwise and when unknown. */
++    val autoTuneDefault: Boolean
++        get() = isNarrow(performanceCoreCount)
++}
+diff --git a/platforms/android/app/src/main/java/com/armsx2/config/Settings.kt b/platforms/android/app/src/main/java/com/armsx2/config/Settings.kt
+index 32df49f..b3c2d5a 100644
+--- a/platforms/android/app/src/main/java/com/armsx2/config/Settings.kt
++++ b/platforms/android/app/src/main/java/com/armsx2/config/Settings.kt
+@@ -300,8 +300,9 @@ data class EmuCoreSettings(
+     val hostFs: Boolean = false,
+     /** EmuCore/AutoTune — automatic performance tuning: when a game keeps missing frames, the core tries
+      *  performance settings one at a time and keeps the ones that help, saved in the game's own settings
+-     *  (see [com.armsx2.config.AutoTuneStore]). Off by default. */
+-    val autoTune: Boolean = false,
++     *  (see [com.armsx2.config.AutoTuneStore]). Off by default, except on a device with fewer performance
++     *  cores than the core has busy threads (see [DeviceTier]), where it is on. */
++    val autoTune: Boolean = DeviceTier.autoTuneDefault,
+     /** RetroAchievements' options, the [Achievements] INI section. */
+     val achievements: AchievementsSettings = AchievementsSettings(),
+     /** EmuCore/EnablePINE — the IPC server external tools drive the emulator through
+diff --git a/platforms/android/app/src/test/java/com/armsx2/config/DeviceTierTest.kt b/platforms/android/app/src/test/java/com/armsx2/config/DeviceTierTest.kt
+new file mode 100644
+index 0000000..d4d6e33
+--- /dev/null
++++ b/platforms/android/app/src/test/java/com/armsx2/config/DeviceTierTest.kt
+@@ -0,0 +1,100 @@
++package com.armsx2.config
++
++import java.io.File
++import java.nio.file.Files
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * The tier probe must agree with the native IopThread::PerformanceMask, because the default it drives is
++ * "the core's thread placement cannot fit this device". The capacity values below are synthetic: only the
++ * ratio between them matters, and the real numbers differ by device.
++ */
++class DeviceTierTest {
++    private fun cores(vararg groups: Pair<Int, Int>): List<Int> =
++        groups.flatMap { (count, capacity) -> List(count) { capacity } }
++
++    @Test
++    fun twoFastCoresAndSixLittleOnesIsNarrow() {
++        val tier = DeviceTier.performanceCores(cores(6 to 250, 2 to 1024))
++        assertEquals(2, tier)
++        assertTrue(DeviceTier.isNarrow(tier))
++    }
++
++    @Test
++    fun threeFastCoresHoldEeGsAndVu1() {
++        val tier = DeviceTier.performanceCores(cores(4 to 250, 3 to 1024, 1 to 1024))
++        assertEquals(4, tier)
++        assertFalse(DeviceTier.isNarrow(tier))
++        assertFalse(DeviceTier.isNarrow(DeviceTier.performanceCores(cores(5 to 250, 3 to 1024))))
++    }
++
++    @Test
++    fun primePlusGoldCoresAreOneTier() {
++        // One core at the top and three within 0.75 of it, then four little ones.
++        val tier = DeviceTier.performanceCores(cores(4 to 250, 3 to 871, 1 to 1024))
++        assertEquals(4, tier)
++        assertFalse(DeviceTier.isNarrow(tier))
++    }
++
++    @Test
++    fun aCoreJustBelowTheRatioIsNotInTheTier() {
++        // threshold = (1000 * 0.75).toInt() = 750: 750 is in, 749 is out.
++        assertEquals(3, DeviceTier.performanceCores(listOf(1000, 750, 750, 749)))
++    }
++
++    @Test
++    fun identicalCoresAreAllPerformanceCores() {
++        assertEquals(8, DeviceTier.performanceCores(cores(8 to 1024)))
++        assertFalse(DeviceTier.isNarrow(8))
++    }
++
++    @Test
++    fun unreadableCapacityIsUnknownAndChangesNothing() {
++        assertNull(DeviceTier.performanceCores(emptyList()))
++        assertNull(DeviceTier.performanceCores(cores(8 to 0)))
++        assertFalse(DeviceTier.isNarrow(null))
++    }
++
++    @Test
++    fun anUnreadableCoreIsNeverCounted() {
++        assertEquals(2, DeviceTier.performanceCores(listOf(1024, 1024, 0, 0)))
++    }
++
++    @Test
++    fun offDeviceTheDefaultIsUnchanged() {
++        // The JVM running these tests is not ART, so nothing is probed.
++        assertNull(DeviceTier.performanceCoreCount)
++        assertFalse(DeviceTier.autoTuneDefault)
++        assertFalse(Settings().emuCore.autoTune)
++    }
++
++    @Test
++    fun readsCapacitiesFromSysfsLayout() {
++        val root = Files.createTempDirectory("cpu").toFile()
++        try {
++            // Created out of order, with the directories sysfs also has under /sys/devices/system/cpu.
++            val capacities = mapOf(10 to "1024\n", 2 to "250\n", 0 to "250\n", 1 to "250")
++            for ((id, text) in capacities) {
++                File(root, "cpu$id").mkdirs()
++                File(root, "cpu$id/cpu_capacity").writeText(text)
++            }
++            File(root, "cpu3").mkdirs() // no cpu_capacity node: reads as 0
++            File(root, "cpufreq").mkdirs()
++            File(root, "cpuidle").mkdirs()
++            File(root, "possible").writeText("0-10")
++
++            assertEquals(listOf(250, 250, 250, 0, 1024), DeviceTier.readCapacities(root))
++        } finally {
++            root.deleteRecursively()
++        }
++    }
++
++    @Test
++    fun aMissingDirectoryReadsAsEmpty() {
++        assertEquals(emptyList<Int>(), DeviceTier.readCapacities(File("/definitely/not/here")))
++    }
++}
